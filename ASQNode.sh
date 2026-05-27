@@ -62,7 +62,7 @@ while [[ $# -gt 0 ]]; do
     --uid|-uid)
       [[ $# -ge 2 ]] || { echo "缺少 --uid 的值" 1>&2; usage; exit 2; }
       RUN_UID="$2"; shift 2;;
-    --ch|-ch)
+    --ch/-ch)
       [[ $# -ge 2 ]] || { echo "缺少 --ch 的值" 1>&2; usage; exit 2; }
       RUN_CH="$2"; shift 2;;
     --type/-t)
@@ -407,16 +407,16 @@ fi
 echo "[INFO] 开始拉取主业务包..."
 cd /root || cd /tmp
 
-# 【彻底修复位置】将下载路径里的错误目录名 ttmanager2 还原为官方正确的 ttmanager
+# 【已彻底纠正】下载地址精准复原为官方正确的带有 ttmanager2 的路径
 if command -v wget >/dev/null 2>&1; then
-  wget --tries=2 --timeout=8 $WGET_IP_FLAG -O ttmanager https://tiptime-api.com/cdn/ttmanager/1.18.17/ttmanager_amd64 || \
-  wget --tries=2 --timeout=8 $WGET_IP_FLAG -O ttmanager http://tiptime-api.com/cdn/ttmanager/1.18.17/ttmanager_amd64
+  wget --tries=2 --timeout=8 $WGET_IP_FLAG -O ttmanager https://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64 || \
+  wget --tries=2 --timeout=8 $WGET_IP_FLAG -O ttmanager http://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64
 elif command -v curl >/dev/null 2>&1; then
-  curl $CURL_IP_FLAG --retry 2 --connect-timeout 5 -fsSL -o ttmanager https://tiptime-api.com/cdn/ttmanager/1.18.17/ttmanager_amd64 || \
-  curl $CURL_IP_FLAG --retry 2 --connect-timeout 5 -fsSL -o ttmanager http://tiptime-api.com/cdn/ttmanager/1.18.17/ttmanager_amd64
+  curl $CURL_IP_FLAG --retry 2 --connect-timeout 5 -fsSL -o ttmanager https://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64 || \
+  curl $CURL_IP_FLAG --retry 2 --connect-timeout 5 -fsSL -o ttmanager http://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64
 else
   apt-get update && apt-get install -y curl
-  curl $CURL_IP_FLAG --retry 2 -fsSL -o ttmanager https://tiptime-api.com/cdn/ttmanager/1.18.17/ttmanager_amd64
+  curl $CURL_IP_FLAG --retry 2 -fsSL -o ttmanager https://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64
 fi
 chmod +x ttmanager || true
 
