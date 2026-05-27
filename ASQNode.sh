@@ -214,3 +214,270 @@ if ! $DOCKER_ONLY && $ENABLE_MOUNT; then
   if [[ ! -b "$DEVICE" ]]; then
     echo "[WARN] 指定设备不存在或不是块设备: $DEVICE"
     AUTO_DEVICE="$(detect_data_device || true)"
+    if [[ -n "$AUTO_DEVICE" && -b "$AUTO_DEVICE" ]]; then
+      DEVICE="$AUTO_DEVICE"
+      echo "[INFO] 自动识别到数据盘设备: $DEVICE"
+    else
+      echo "[ERROR] 未找到可用数据盘，请通过 --device 指定" 1>&2
+      lsblk -o NAME,SIZE,TYPE,MOUNTPOINT 1>&2 || true
+      exit 1
+    fi
+  fi
+  echo "[INFO] 实际挂载设备: $DEVICE"
+
+  cleanup_lvm_on_device() {
+    local dev="$1"
+    echo "[INFO] 检查设备 $dev 上的 LVM 结构..."
+    local lvm_volumes=$(lsblk -ln -o NAME,TYPE "$dev" 2>/dev/null | awk '$2=="lvm"{print $1}' || true)
+    if [[ -z "$lvm_volumes" ]]; then
+      echo "[INFO] 未检测到 LVM 结构"
+      return 0
+    fi
+
+    echo "[WARN] 检测到 LVM 结构，开始清理..."
+    command -v vgs >/dev/null 2>&1 || { echo "[INFO] 安装 lvm2..." 1>&2; apt-get update && apt-get install -y lvm2 || exit 1; }
+    
+    while IFS= read -r lv_name; do
+      if [[ -n "$lv_name" ]]; then
+        local lv_dev="/dev/mapper/${lv_name}"
+        if findmnt "$lv_dev" >/dev/null 2>&1; then
+          umount -f "$lv_dev" 2>/dev/null || true
+        fi
+      fi
+    done <<< "$lvm_volumes"
+    
+    local vg_list=$(pvs --noheadings -o vg_name "$dev" 2>/dev/null | sort -u | tr -d ' ' || true)
+    if [[ -n "$vg_list" ]]; then
+      while IFS= read -r vg_name; do
+        if [[ -n "$vg_name" ]]; then
+          local lv_paths=$(lvs --noheadings -o lv_path "$vg_name" 2>/dev/null || true)
+          while IFS= read -r lv_path; do
+            if [[ -n "$lv_path" ]]; then
+              lv_path=$(echo "$lv_path" | tr -d ' ')
+              lvremove -f "$lv_path" 2>/dev/null || true
+            fi
+          done <<< "$lv_paths"
+          vgremove -f "$vg_name" 2>/dev/null || true
+        fi
+      done <<< "$vg_list"
+    fi
+    
+    if pvs "$dev" >/dev/null 2>&1; then
+      pvremove -f "$dev" 2>/dev/null || true
+    fi
+    
+    echo "[INFO] 清除设备 $dev 的分区表和元数据..."
+    wipefs -a "$dev" 2>/dev/null || dd if=/dev/zero of="$dev" bs=1M count=100 2>/dev/null || true
+    
+    command -v partprobe >/dev/null 2>&1 || apt-get install -y parted || true
+    partprobe "$dev" 2>/dev/null || true
+    sleep 2
+  }
+
+  if lsblk -ln -o NAME,TYPE "$DEVICE" 2>/dev/null | awk '$2=="lvm"{found=1} END {exit found ? 0 : 1}'; then
+    if ! $ALLOW_FORMAT; then
+      echo "[ERROR] 检测到 LVM 结构，但已指定 --no-format" 1>&2
+      exit 1
+    fi
+    cleanup_lvm_on_device "$DEVICE"
+  fi
+
+  TARGET_BLOCK="$DEVICE"
+  child_parts=$(lsblk -ln -o NAME,TYPE "$DEVICE" | awk '$2=="part"{print $1}') || true
+  if [[ -n "${child_parts}" ]]; then
+    largest_part=$(lsblk -ln -o NAME,SIZE,TYPE | awk -v rootdev="$(basename "$DEVICE")" '$3=="part" && index($1,rootdev)==1{print $0}' | sort -k2 -h | tail -n1 | awk '{print $1}') || true
+    if [[ -n "${largest_part:-}" ]]; then
+      TARGET_BLOCK="/dev/${largest_part}"
+      echo "[INFO] 检测到分区，将使用分区: $TARGET_BLOCK"
+    fi
+  fi
+
+  SKIP_MOUNT=false
+  if findmnt -rn "$MOUNT_POINT" >/dev/null 2>&1; then
+    src=$(findmnt -rn -o SOURCE --target "$MOUNT_POINT" || true)
+    if [[ -n "${src:-}" ]]; then
+      tgt_uuid=$(blkid -s UUID -o value "$TARGET_BLOCK" || true)
+      if [[ "$src" == "$TARGET_BLOCK" ]] || [[ -n "${tgt_uuid:-}" && "$src" == *"UUID=$tgt_uuid"* ]]; then
+        echo "[INFO] 挂载点已是期望设备，跳过挂载动作"
+        SKIP_MOUNT=true
+      else
+        echo "[ERROR] 挂载点 $MOUNT_POINT 已被 $src 占用" 1>&2
+        exit 1
+      fi
+    fi
+  fi
+
+  if ! $SKIP_MOUNT; then
+    FSTYPE=$(lsblk -no FSTYPE "$TARGET_BLOCK" | head -n1 || true)
+    if [[ -z "${FSTYPE:-}" ]]; then
+      if ! $ALLOW_FORMAT; then
+        echo "[ERROR] 设备无文件系统且禁止格式化" 1>&2
+        exit 1
+      fi
+      echo "[INFO] 设备无文件系统，准备格式化为 ext4..."
+      command -v mkfs.ext4 >/dev/null 2>&1 || apt-get install -y e2fsprogs
+      mkfs.ext4 -F "$TARGET_BLOCK"
+      FSTYPE="ext4"
+    fi
+
+    mkdir -p "$MOUNT_POINT"
+    UUID=$(blkid -s UUID -o value "$TARGET_BLOCK")
+    
+    cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
+    tmpfstab=$(mktemp)
+    grep -Ev "(^UUID=${UUID}[[:space:]]|^[^#].*[[:space:]]$MOUNT_POINT[[:space:]]|^[[:space:]]*${TARGET_BLOCK//\//\\/}[[:space:]])" /etc/fstab > "$tmpfstab" || true
+    printf "UUID=%s %s %s defaults,noatime 0 2\n" "$UUID" "$MOUNT_POINT" "$FSTYPE" >> "$tmpfstab"
+    mv "$tmpfstab" /etc/fstab
+
+    mount -a || true
+
+    src_after=$(findmnt -rn -o SOURCE --target "$MOUNT_POINT" || true)
+    if [[ -z "${src_after:-}" ]]; then
+      if ! $ALLOW_FORMAT; then
+        echo "[ERROR] mount -a 失败且禁止格式化" 1>&2
+        exit 1
+      fi
+      echo "[WARN] 挂载失败，尝试重新初始化为 ext4..."
+      umount -f "$MOUNT_POINT" >/dev/null 2>&1 || true
+      mkfs.ext4 -F "$TARGET_BLOCK"
+      UUID=$(blkid -s UUID -o value "$TARGET_BLOCK")
+      tmpfstab=$(mktemp)
+      grep -Ev "(^[^#].*[[:space:]]$MOUNT_POINT[[:space:]]|^[[:space:]]*${TARGET_BLOCK//\//\\/}[[:space:]])" /etc/fstab > "$tmpfstab" || true
+      printf "UUID=%s %s ext4 defaults,noatime 0 2\n" "$UUID" "$MOUNT_POINT" >> "$tmpfstab"
+      mv "$tmpfstab" /etc/fstab
+      mount -a || true
+    fi
+    echo "[OK] 磁盘挂载成功"
+  fi
+fi
+
+if $MOUNT_ONLY; then
+  echo "[INFO] 仅挂载模式完成，退出"
+  exit 0
+fi
+
+# ==================== Debian 12 Docker 安装分支 ====================
+if $SKIP_DOCKER; then
+  echo "[INFO] 跳过 Docker 安装流程"
+else
+  if command -v docker >/dev/null 2>&1; then
+    echo "[INFO] 检测到已安装 Docker，跳过安装步骤"
+  else
+    echo "[INFO] 正在为 Debian 12 (amd64) 配置 APT 官方 Docker 源..."
+    for pkg in docker.io docker-doc docker-compose podman-docker container-snapshot; do 
+      apt-get remove -y $pkg >/dev/null 2>&1 || true
+    done
+    
+    apt-get update
+    apt-get install -y ca-certificates curl gnupg
+
+    install -m 0755 -d /etc/apt/keyrings
+    rm -f /etc/apt/keyrings/docker.gpg
+    
+    # 默认采用更稳定防超时的阿里云镜像源
+    curl -fsSL "https://mirrors.aliyun.com/docker-ce/linux/debian/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+
+    echo \
+      "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/debian \
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+      tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    apt-get update
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json <<'JSON'
+{
+  "exec-opts": ["native.cgroupdriver=cgroupfs"]
+}
+JSON
+
+    systemctl daemon-reload
+    systemctl enable docker
+    systemctl restart docker
+    echo "[OK] Docker 环境部署完毕"
+  fi
+fi
+
+if $DOCKER_ONLY; then
+  echo "[INFO] --docker-only 模式完成，退出"
+  exit 0
+fi
+
+# ==================== 业务程序拉取及后台运作 (外置统一运行) ====================
+echo "[INFO] 开始拉取主业务包..."
+cd /root || cd /tmp
+
+if command -v wget >/dev/null 2>&1; then
+  wget --tries=2 --timeout=8 $WGET_IP_FLAG -O ttmanager https://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64 || \
+  wget --tries=2 --timeout=8 $WGET_IP_FLAG -O ttmanager http://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64
+elif command -v curl >/dev/null 2>&1; then
+  curl $CURL_IP_FLAG --retry 2 --connect-timeout 5 -fsSL -o ttmanager https://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64 || \
+  curl $CURL_IP_FLAG --retry 2 --connect-timeout 5 -fsSL -o ttmanager http://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64
+else
+  apt-get update && apt-get install -y curl
+  curl $CURL_IP_FLAG --retry 2 -fsSL -o ttmanager https://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64
+fi
+chmod +x ttmanager || true
+
+if command -v wget >/dev/null 2>&1; then
+  wget --tries=2 --timeout=8 $WGET_IP_FLAG -O config.yaml https://tiptime-api.com/cdn/config_example/config.yaml || true
+else
+  curl $CURL_IP_FLAG --retry 2 -fsSL -o config.yaml https://tiptime-api.com/cdn/config_example/config.yaml || true
+fi
+
+./ttmanager -g || true
+
+# 构造动态命令数组
+TT_RUN_ARGS=()
+[[ -n "${RUN_CH:-}" ]] && TT_RUN_ARGS+=(-ch "$RUN_CH")
+[[ -n "${RUN_TYPE:-}" ]] && TT_RUN_ARGS+=(-t "$RUN_TYPE")
+$ENABLE_MOUNT && TT_RUN_ARGS+=(-c "$MOUNT_POINT")
+[[ -n "${RUN_UID:-}" ]] && TT_RUN_ARGS+=(-uid "$RUN_UID")
+
+echo "[INFO] 启动 ttrun.sh 参数: ${TT_RUN_ARGS[*]}"
+nohup ./ttrun.sh "${TT_RUN_ARGS[@]}" >/dev/null 2>&1 &
+
+# 构建持久化自启命令
+TT_RUN_CMD="./ttrun.sh"
+[[ -n "${RUN_CH:-}" ]] && TT_RUN_CMD+=" -ch $(printf '%q' "$RUN_CH")"
+[[ -n "${RUN_TYPE:-}" ]] && TT_RUN_CMD+=" -t $(printf '%q' "$RUN_TYPE")"
+$ENABLE_MOUNT && TT_RUN_CMD+=" -c $(printf '%q' "$MOUNT_POINT")"
+[[ -n "${RUN_UID:-}" ]] && TT_RUN_CMD+=" -uid $(printf '%q' "$RUN_UID")"
+TT_RUN_REMOVE_REGEX='ttrun\.sh.*-t[[:space:]]+[^[:space:]]+'
+
+# 1. 写入 crontab 开机自启
+if command -v crontab >/dev/null 2>&1 || apt-get install -y cron; then
+  systemctl enable cron || true
+  systemctl start cron || true
+  CRON_LINE="@reboot cd /root && nohup ${TT_RUN_CMD} >/dev/null 2>&1 &"
+  tmp_cron="$(mktemp)"
+  (crontab -l 2>/dev/null || true) | grep -Ev "$TT_RUN_REMOVE_REGEX" > "$tmp_cron" || true
+  echo "$CRON_LINE" >> "$tmp_cron"
+  crontab "$tmp_cron"
+  rm -f "$tmp_cron"
+fi
+
+# 2. 写入 rc.local 开机自启双层保障
+RC_LOCAL="/etc/rc.local"
+if [[ ! -f "$RC_LOCAL" ]]; then
+  echo '#!/bin/sh -e' > "$RC_LOCAL"
+  echo 'exit 0' >> "$RC_LOCAL"
+fi
+chmod +x "$RC_LOCAL"
+
+tmp_rc_local="$(mktemp)"
+grep -Ev "exit 0|$TT_RUN_REMOVE_REGEX" "$RC_LOCAL" > "$tmp_rc_local" || true
+echo "cd /root && nohup ${TT_RUN_CMD} >/dev/null 2>&1 &" >> "$tmp_rc_local"
+echo "exit 0" >> "$tmp_rc_local"
+mv "$tmp_rc_local" "$RC_LOCAL"
+chmod +x "$RC_LOCAL"
+
+if [[ -f /lib/systemd/system/rc-local.service ]]; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable rc-local >/dev/null 2>&1 || true
+  systemctl start rc-local >/dev/null 2>&1 || true
+fi
+
+echo "[OK] Debian 12 节点一键部署全流程执行成功！"
