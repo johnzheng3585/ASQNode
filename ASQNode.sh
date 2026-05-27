@@ -148,7 +148,7 @@ fi
 
 # 确保 DNS 正常
 ensure_dns() {
-  local test_host="mirrors.aliyun.com"
+  local test_host="mirrors.tuna.tsinghua.edu.cn"
   if ! getent hosts "$test_host" >/dev/null 2>&1; then
     echo "[WARN] DNS 解析失败，写入公共 DNS"
     printf "nameserver 223.5.5.5\nnameserver 119.29.29.29\n" > /etc/resolv.conf || true
@@ -373,11 +373,11 @@ else
     install -m 0755 -d /etc/apt/keyrings
     rm -f /etc/apt/keyrings/docker.gpg
     
-    curl -fsSL "https://mirrors.aliyun.com/docker-ce/linux/debian/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    curl -fsSL "https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/debian/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     chmod a+r /etc/apt/keyrings/docker.gpg
 
     echo \
-      "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/debian \
+      "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/debian \
       $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
       tee /etc/apt/sources.list.d/docker.list > /dev/null
 
