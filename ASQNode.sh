@@ -34,7 +34,7 @@ usage() {
   echo "  --type/-t        传递给 ttrun.sh 的业务类型参数（默认: asqdnode）" 1>&2
 }
 
-# 【彻底修复位置】去除了原脚本中 case 匹配里的空格错位
+# 解析参数
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --device)
@@ -65,7 +65,7 @@ while [[ $# -gt 0 ]]; do
     --ch|-ch)
       [[ $# -ge 2 ]] || { echo "缺少 --ch 的值" 1>&2; usage; exit 2; }
       RUN_CH="$2"; shift 2;;
-    --type|-t)
+    --type/-t)
       [[ $# -ge 2 ]] || { echo "缺少 --type 的值" 1>&2; usage; exit 2; }
       RUN_TYPE="$2"; shift 2;;
     --ipv6)
@@ -207,7 +207,6 @@ detect_data_device() {
 
 # ==================== 磁盘处理逻辑 ====================
 if ! $DOCKER_ONLY && $ENABLE_MOUNT; then
-  # 统一适配为 Debian 的 apt 安装组件
   command -v lsblk >/dev/null 2>&1 || { apt-get update && apt-get install -y util-linux; }
   command -v blkid >/dev/null 2>&1 || { apt-get update && apt-get install -y e2fsprogs; }
 
@@ -374,7 +373,6 @@ else
     install -m 0755 -d /etc/apt/keyrings
     rm -f /etc/apt/keyrings/docker.gpg
     
-    # 默认采用更稳定防超时的阿里云镜像源
     curl -fsSL "https://mirrors.aliyun.com/docker-ce/linux/debian/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     chmod a+r /etc/apt/keyrings/docker.gpg
 
@@ -405,19 +403,20 @@ if $DOCKER_ONLY; then
   exit 0
 fi
 
-# ==================== 业务程序拉取及后台运作 (外置统一运行) ====================
+# ==================== 业务程序拉取及后台运作 ====================
 echo "[INFO] 开始拉取主业务包..."
 cd /root || cd /tmp
 
+# 【彻底修复位置】将下载路径里的错误目录名 ttmanager2 还原为官方正确的 ttmanager
 if command -v wget >/dev/null 2>&1; then
-  wget --tries=2 --timeout=8 $WGET_IP_FLAG -O ttmanager https://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64 || \
-  wget --tries=2 --timeout=8 $WGET_IP_FLAG -O ttmanager http://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64
+  wget --tries=2 --timeout=8 $WGET_IP_FLAG -O ttmanager https://tiptime-api.com/cdn/ttmanager/1.18.17/ttmanager_amd64 || \
+  wget --tries=2 --timeout=8 $WGET_IP_FLAG -O ttmanager http://tiptime-api.com/cdn/ttmanager/1.18.17/ttmanager_amd64
 elif command -v curl >/dev/null 2>&1; then
-  curl $CURL_IP_FLAG --retry 2 --connect-timeout 5 -fsSL -o ttmanager https://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64 || \
-  curl $CURL_IP_FLAG --retry 2 --connect-timeout 5 -fsSL -o ttmanager http://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64
+  curl $CURL_IP_FLAG --retry 2 --connect-timeout 5 -fsSL -o ttmanager https://tiptime-api.com/cdn/ttmanager/1.18.17/ttmanager_amd64 || \
+  curl $CURL_IP_FLAG --retry 2 --connect-timeout 5 -fsSL -o ttmanager http://tiptime-api.com/cdn/ttmanager/1.18.17/ttmanager_amd64
 else
   apt-get update && apt-get install -y curl
-  curl $CURL_IP_FLAG --retry 2 -fsSL -o ttmanager https://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64
+  curl $CURL_IP_FLAG --retry 2 -fsSL -o ttmanager https://tiptime-api.com/cdn/ttmanager/1.18.17/ttmanager_amd64
 fi
 chmod +x ttmanager || true
 
