@@ -66,13 +66,13 @@ while [[ $# -gt 0 ]]; do
       ALLOW_FORMAT=true; shift;;
     --no-format|--skip-format)
       ALLOW_FORMAT=false; shift;;
-    --uid/-uid)
+    --uid|-uid)
       [[ $# -ge 2 ]] || { echo "缺少 --uid 的值" 1>&2; usage; exit 2; }
       RUN_UID="$2"; shift 2;;
-    --ch/-ch)
+    --ch|-ch)
       [[ $# -ge 2 ]] || { echo "缺少 --ch 的值" 1>&2; usage; exit 2; }
       RUN_CH="$2"; shift 2;;
-    --type/-t)
+    --type|-t)
       [[ $# -ge 2 ]] || { echo "缺少 --type 的值" 1>&2; usage; exit 2; }
       RUN_TYPE="$2"; shift 2;;
     --ipv6)
@@ -154,7 +154,9 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 
+# 全局优先使用 IPv4（glibc gai、curl、wget、yum），避免 IPv6 受限环境导致超时
 ensure_ipv4_default() {
+  # glibc name resolution 优先 IPv4-mapped
   if [[ -f /etc/gai.conf ]]; then
     if ! grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100' /etc/gai.conf; then
       if grep -Eq '^[#;][[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100' /etc/gai.conf; then
@@ -167,12 +169,14 @@ ensure_ipv4_default() {
     echo 'precedence ::ffff:0:0/96  100' > /etc/gai.conf || true
   fi
 
+  # curl 全局配置
   if [[ -f /etc/curlrc ]]; then
     grep -q '^ipv4\b' /etc/curlrc || echo 'ipv4' >> /etc/curlrc
   else
     echo 'ipv4' > /etc/curlrc
   fi
 
+  # wget 全局配置
   if [[ -f /etc/wgetrc ]]; then
     if grep -Eq '^#?\s*prefer-family' /etc/wgetrc; then
       sed -i -E 's/^#?\s*prefer-family.*/prefer-family = IPv4/' /etc/wgetrc || true
@@ -183,6 +187,7 @@ ensure_ipv4_default() {
     echo 'prefer-family = IPv4' > /etc/wgetrc
   fi
 
+  # yum 全局 IPv4 解析
   if [[ -f /etc/yum.conf ]]; then
     if grep -q '^ip_resolve=' /etc/yum.conf; then
       sed -i -E 's/^ip_resolve=.*/ip_resolve=4/' /etc/yum.conf || true
@@ -246,6 +251,7 @@ detect_data_device() {
 
 if ! $DOCKER_ONLY && $ENABLE_MOUNT; then
 
+# 基本检查
 command -v lsblk >/dev/null 2>&1 || { echo "[ERROR] 缺少 lsblk 命令" 1>&2; exit 1; }
 command -v blkid >/dev/null 2>&1 || { echo "[ERROR] 缺少 blkid 命令" 1>&2; exit 1; }
 
@@ -263,18 +269,25 @@ if [[ ! -b "$DEVICE" ]]; then
 fi
 echo "[INFO] 实际挂载设备: $DEVICE"
 
+# 检测并清理 LVM 结构
 cleanup_lvm_on_device() {
   local dev="$1"
   echo "[INFO] 检查设备 $dev 上的 LVM 结构..."
+  
+  # 检测是否有 LVM 逻辑卷
   local lvm_volumes=$(lsblk -ln -o NAME,TYPE "$dev" 2>/dev/null | awk '$2=="lvm"{print $1}' || true)
+  
   if [[ -z "$lvm_volumes" ]]; then
     echo "[INFO] 未检测到 LVM 结构"
     return 1
   fi
 
   echo "[WARN] 检测到 LVM 结构，开始清理..."
+  
+  # 确保 LVM 命令可用
   command -v vgs >/dev/null 2>&1 || { echo "[ERROR] 缺少 LVM 工具，尝试安装 lvm2..." 1>&2; yum install -y lvm2 || exit 1; }
   
+  # 1. 卸载所有挂载的逻辑卷
   while IFS= read -r lv_name; do
     if [[ -n "$lv_name" ]]; then
       local lv_dev="/dev/mapper/${lv_name}"
@@ -285,11 +298,15 @@ cleanup_lvm_on_device() {
     fi
   done <<< "$lvm_volumes"
   
+  # 2. 获取设备上的所有卷组
   local vg_list=$(pvs --noheadings -o vg_name "$dev" 2>/dev/null | sort -u | tr -d ' ' || true)
+  
   if [[ -n "$vg_list" ]]; then
     while IFS= read -r vg_name; do
       if [[ -n "$vg_name" && "$vg_name" != "" ]]; then
         echo "[INFO] 处理卷组: $vg_name"
+        
+        # 3. 删除该卷组下的所有逻辑卷
         local lv_paths=$(lvs --noheadings -o lv_path "$vg_name" 2>/dev/null || true)
         while IFS= read -r lv_path; do
           if [[ -n "$lv_path" ]]; then
@@ -298,20 +315,27 @@ cleanup_lvm_on_device() {
             lvremove -f "$lv_path" 2>/dev/null || true
           fi
         done <<< "$lv_paths"
+        
+        # 4. 删除卷组
         echo "[INFO] 删除卷组: $vg_name"
         vgremove -f "$vg_name" 2>/dev/null || true
       fi
     done <<< "$vg_list"
   fi
   
+  # 5. 删除物理卷
   if pvs "$dev" >/dev/null 2>&1; then
     echo "[INFO] 删除物理卷: $dev"
     pvremove -f "$dev" 2>/dev/null || true
   fi
   
+  # 6. 清除所有分区表和 LVM 元数据
   echo "[INFO] 清除设备 $dev 的分区表和元数据..."
   wipefs -a "$dev" 2>/dev/null || dd if=/dev/zero of="$dev" bs=1M count=100 2>/dev/null || true
+  
   echo "[OK] LVM 结构清理完成"
+  
+  # 重新扫描设备
   partprobe "$dev" 2>/dev/null || true
   sleep 2
 }
@@ -319,8 +343,12 @@ cleanup_lvm_on_device() {
 is_mountable_fstype() {
   local fstype="${1:-}"
   case "$fstype" in
-    ""|LVM2_member|linux_raid_member|crypto_LUKS|swap) return 1 ;;
-    *) return 0 ;;
+    ""|LVM2_member|linux_raid_member|crypto_LUKS|swap)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
   esac
 }
 
@@ -328,6 +356,7 @@ detect_block_fstype() {
   local block="$1"
   local mount_point="${2:-}"
   local fstype=""
+
   fstype=$(lsblk -no FSTYPE "$block" | head -n1 || true)
   if [[ -z "${fstype:-}" ]]; then
     fstype=$(blkid -s TYPE -o value "$block" 2>/dev/null || true)
@@ -335,6 +364,7 @@ detect_block_fstype() {
   if [[ -z "${fstype:-}" && -n "${mount_point:-}" ]]; then
     fstype=$(findmnt -rn -o FSTYPE --target "$mount_point" 2>/dev/null || true)
   fi
+
   echo "$fstype"
 }
 
@@ -365,6 +395,7 @@ ensure_fstab_entry_if_missing() {
   echo "[INFO] 已补全 /etc/fstab: UUID=$uuid -> $mount_point (${fstype:-ext4})"
 }
 
+# 清理设备上的 LVM（如果存在）
 if lsblk -ln -o NAME,TYPE "$DEVICE" 2>/dev/null | awk '$2=="lvm"{found=1} END {exit found ? 0 : 1}'; then
   if ! $ALLOW_FORMAT; then
     echo "[ERROR] 检测到设备 $DEVICE 存在 LVM 结构，但已指定 --no-format，无法继续清理并挂载" 1>&2
@@ -375,9 +406,11 @@ else
   echo "[INFO] 未检测到 LVM 结构"
 fi
 
+# 若设备包含分区，优先使用最大分区
 TARGET_BLOCK="$DEVICE"
 child_parts=$(lsblk -ln -o NAME,TYPE "$DEVICE" | awk '$2=="part"{print $1}') || true
 if [[ -n "${child_parts}" ]]; then
+  # 选择容量最大的分区
   largest_part=$(lsblk -ln -o NAME,SIZE,TYPE | awk -v rootdev="$(basename "$DEVICE")" '$3=="part" && index($1,rootdev)==1{print $0}' | sort -k2 -h | tail -n1 | awk '{print $1}') || true
   if [[ -n "${largest_part:-}" ]]; then
     TARGET_BLOCK="/dev/${largest_part}"
@@ -385,10 +418,12 @@ if [[ -n "${child_parts}" ]]; then
   fi
 fi
 
+# 如果挂载点已挂载，且来源就是目标块设备(或其UUID)，则跳过后续挂载流程但继续执行后续安装
 SKIP_MOUNT=false
 if findmnt -rn "$MOUNT_POINT" >/dev/null 2>&1; then
   src=$(findmnt -rn -o SOURCE --target "$MOUNT_POINT" || true)
   if [[ -n "${src:-}" ]]; then
+    # 比较设备名或者UUID是否一致
     tgt_uuid=$(blkid -s UUID -o value "$TARGET_BLOCK" || true)
     if [[ "$src" == "$TARGET_BLOCK" ]] || [[ -n "${tgt_uuid:-}" && "$src" == *"UUID=$tgt_uuid"* ]]; then
       echo "[INFO] 挂载点已是期望设备，跳过挂载动作并检查 /etc/fstab"
@@ -415,6 +450,7 @@ if $SKIP_MOUNT; then
 fi
 
 if ! $SKIP_MOUNT; then
+  # 检测文件系统类型
   FSTYPE=$(lsblk -no FSTYPE "$TARGET_BLOCK" | head -n1 || true)
   if [[ -z "${FSTYPE:-}" ]]; then
     if ! $ALLOW_FORMAT; then
@@ -439,22 +475,31 @@ if ! $SKIP_MOUNT; then
   fi
 
   mkdir -p "$MOUNT_POINT"
+
+  # 获取 UUID
   UUID=$(blkid -s UUID -o value "$TARGET_BLOCK")
   if [[ -z "${UUID:-}" ]]; then
     echo "[ERROR] 无法获取 $TARGET_BLOCK 的 UUID" 1>&2
     exit 1
   fi
 
+  # 备份并更新 /etc/fstab（幂等）
   timestamp=$(date +%Y%m%d%H%M%S)
   cp /etc/fstab "/etc/fstab.bak.$timestamp"
+
+  # 去除与目标设备/UUID/挂载点相关的旧条目，避免重复
   tmpfstab=$(mktemp)
   grep -Ev "(^UUID=${UUID}[[:space:]]|^[^#].*[[:space:]]$MOUNT_POINT[[:space:]]|^[[:space:]]*${TARGET_BLOCK//\//\\/}[[:space:]])" /etc/fstab > "$tmpfstab" || true
+  # 如果已存在 UUID 同步的条目则不重复追加
   if ! grep -q "^UUID=${UUID}[[:space:]]\+${MOUNT_POINT}[[:space:]]" "$tmpfstab"; then
     printf "UUID=%s %s %s defaults,noatime 0 2\n" "$UUID" "$MOUNT_POINT" "${FSTYPE:-ext4}" >> "$tmpfstab"
   fi
   mv "$tmpfstab" /etc/fstab
+
+  # 挂载（允许失败以便触发回退逻辑）
   mount -a || true
 
+  # 校验是否为期望设备挂载（设备名或 UUID 匹配）
   src_after=$(findmnt -rn -o SOURCE --target "$MOUNT_POINT" || true)
   tgt_uuid_chk=$(blkid -s UUID -o value "$TARGET_BLOCK" || true)
   if [[ -n "${src_after:-}" ]] && { [[ "$src_after" == "$TARGET_BLOCK" ]] || { [[ -n "${tgt_uuid_chk:-}" ]] && [[ "$src_after" == *"UUID=$tgt_uuid_chk"* ]]; }; }; then
@@ -464,28 +509,31 @@ if ! $SKIP_MOUNT; then
       echo "[ERROR] mount -a 后未检测到挂载成功，且已指定 --no-format，请检查磁盘文件系统或 /etc/fstab 配置" 1>&2
       exit 1
     fi
-    echo "[WARN] mount -a 后未检测到挂载成功，尝试格式化为 ext4并重试"
+    echo "[WARN] mount -a 后未检测到挂载成功，尝试格式化为 ext4 并重试"
     umount -f "$MOUNT_POINT" >/dev/null 2>&1 || true
     command -v mkfs.ext4 >/dev/null 2>&1 || { echo "[ERROR] 缺少 mkfs.ext4 命令，无法执行回退格式化" 1>&2; exit 1; }
     mkfs.ext4 -F "$TARGET_BLOCK"
+    # 重新获取 UUID
     UUID=$(blkid -s UUID -o value "$TARGET_BLOCK" || true)
     if [[ -z "${UUID:-}" ]]; then
       echo "[ERROR] 回退格式化后仍无法获取 UUID: $TARGET_BLOCK" 1>&2
       exit 1
     fi
+    # 覆盖 /etc/fstab 相关条目并指定 ext4
     timestamp=$(date +%Y%m%d%H%M%S)
     cp /etc/fstab "/etc/fstab.bak.$timestamp"
     tmpfstab=$(mktemp)
     grep -Ev "(^[^#].*[[:space:]]$MOUNT_POINT[[:space:]]|^[[:space:]]*${TARGET_BLOCK//\//\\/}[[:space:]])" /etc/fstab > "$tmpfstab" || true
     printf "UUID=%s %s ext4 defaults,noatime 0 2\n" "$UUID" "$MOUNT_POINT" >> "$tmpfstab"
     mv "$tmpfstab" /etc/fstab
+    # 再次挂载并验证（允许失败以便进入错误提示）
     mount -a || true
     src_after=$(findmnt -rn -o SOURCE --target "$MOUNT_POINT" || true)
     if [[ -n "${src_after:-}" ]] && { [[ "$src_after" == "$TARGET_BLOCK" ]] || [[ "$src_after" == *"UUID=$UUID"* ]]; }; then
       echo "[OK] 回退格式化后已挂载: $TARGET_BLOCK -> $MOUNT_POINT，并已写入 /etc/fstab (UUID=$UUID)"
-    else
+  else
       echo "[ERROR] 回退格式化并 mount -a 后仍未检测到挂载成功，请检查系统日志" 1>&2
-      exit 1
+    exit 1
     fi
   fi
 else
@@ -505,6 +553,8 @@ if $MOUNT_ONLY; then
   exit 0
 fi
 
+# ===== 下面执行系统源更新、安装 Docker、设置 cgroupfs 和 cgroup v1、最后执行固定命令 =====
+
 ensure_cmd() {
   local c="$1"; local pkg="${2:-}";
   if ! command -v "$c" >/dev/null 2>&1; then
@@ -514,17 +564,21 @@ ensure_cmd() {
   fi
 }
 
+# 确保 DNS 可用；若解析失败，写入公共 DNS（阿里/腾讯），尽量减少网络不通导致的仓库错误
 ensure_dns() {
   local test_host="mirrors.aliyun.com"
   if ! getent hosts "$test_host" >/dev/null 2>&1; then
     echo "[WARN] DNS 解析失败，写入公共 DNS 到 /etc/resolv.conf"
     printf "nameserver 223.5.5.5\nnameserver 119.29.29.29\n" > /etc/resolv.conf || true
+    # 追加更多公共 DNS 以增强稳定性
     grep -q '^nameserver 8.8.8.8' /etc/resolv.conf || echo 'nameserver 8.8.8.8' >> /etc/resolv.conf
     grep -q '^nameserver 1.1.1.1' /etc/resolv.conf || echo 'nameserver 1.1.1.1' >> /etc/resolv.conf
+    # 降低 DNS 查询超时
     grep -q '^options timeout:' /etc/resolv.conf || echo 'options timeout:2 attempts:2' >> /etc/resolv.conf
   fi
 }
 
+# 调优 yum 全局参数，降低超时影响与重复下载
 ensure_yum_tuning() {
   if [[ -f /etc/yum.conf ]]; then
     grep -q '^timeout=' /etc/yum.conf && sed -i -E 's/^timeout=.*/timeout=10/' /etc/yum.conf || echo 'timeout=10' >> /etc/yum.conf
@@ -540,21 +594,21 @@ ensure_yum_tuning() {
   fi
 }
 
-# 🛠️ 【优化核心】移除失效的普通源，全部采用存活的 Vault（历史归档）源
+# 仅使用阿里云 CentOS 7 镜像，分别测试 HTTPS 和 HTTP 作为容灾
 choose_centos7_baseurl() {
   local arch
   arch=$(uname -m)
   local candidates=(
-    "https://mirrors.aliyun.com/centos-vault/7.9.2009"
-    "https://mirrors.ustc.edu.cn/centos-vault/7.9.2009"
-    "http://vault.centos.org/7.9.2009"
-    "http://mirrors.aliyun.com/centos-vault/7.9.2009"
+    "https://mirrors.aliyun.com/centos/7/os/\$basearch/"
+    "http://mirrors.aliyun.com/centos/7/os/\$basearch/"
   )
 
   local test_arch="$arch"
   local url; local best_url=""; local best_time=999999
   for url in "${candidates[@]}"; do
-    local probe_url="${url}/os/${test_arch}/"
+    local probe_url
+    probe_url=${url/\$basearch/$test_arch}
+    # 测速：成功返回时记录耗时，取最小者
     local t
     t=$(curl $CURL_IP_FLAG -o /dev/null -sS -w '%{time_total}' --connect-timeout 3 --max-time 5 "${probe_url}repodata/repomd.xml" 2>/dev/null || echo "")
     if [[ -n "$t" ]]; then
@@ -567,8 +621,9 @@ choose_centos7_baseurl() {
   return 1
 }
 
+# 写入自定义 repo（使用独立的 repo id，避免与系统自带 base/updates/extras 重名）
 write_centos7_repo() {
-  local repo_file="$1"; local base_prefix="$2" 
+  local repo_file="$1"; local base_prefix="$2" # 形如 https://mirror/centos/7
   mkdir -p /etc/yum.repos.d
   {
     echo "[centos7-base-local]"
@@ -591,6 +646,7 @@ write_centos7_repo() {
   } > "$repo_file"
 }
 
+# 带重试的 yum 安装封装（清理缓存+指数回退）
 yum_retry_install() {
   local enabled_repos="$1"; shift
   local pkgs=("$@")
@@ -611,37 +667,34 @@ yum_retry_install() {
   return 1
 }
 
+# 在 EL7 仓库中安装 Docker CE，仅使用阿里云镜像。优先安装 26.1.3-1.el7；若失败则从高到低逐个版本降级尝试。
 install_docker_el7_with_fallback() {
   ensure_yum_tuning
+  # 可选：存在才使用 yum-config-manager；无则跳过
   if command -v yum-config-manager >/dev/null 2>&1; then
     yum-config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo || true
   fi
+  
+  # 仅保留阿里云的 Docker CE 镜像源进行测速（HTTPS 和 HTTP 备用）
   local arch
   arch=$(uname -m)
-  local docker_candidates=()
-  if $DOCKER_ALIYUN_ONLY; then
-    docker_candidates=(
-      "https://mirrors.aliyun.com/docker-ce/linux/centos/7/\$basearch/stable/"
-      "http://mirrors.aliyun.com/docker-ce/linux/centos/7/\$basearch/stable/"
-    )
-  else
-    docker_candidates=(
-      "https://mirrors.aliyun.com/docker-ce/linux/centos/7/\$basearch/stable/"
-      "https://mirrors.ustc.edu.cn/docker-ce/linux/centos/7/\$basearch/stable/"
-      "https://download.docker.com/linux/centos/7/\$basearch/stable/"
-      "http://mirrors.aliyun.com/docker-ce/linux/centos/7/\$basearch/stable/"
-    )
-  fi
+  local docker_candidates=(
+    "https://mirrors.aliyun.com/docker-ce/linux/centos/7/\$basearch/stable/"
+    "http://mirrors.aliyun.com/docker-ce/linux/centos/7/\$basearch/stable/"
+  )
+
   local chosen_docker_url=""
   local dc; local best_time=999999
   for dc in "${docker_candidates[@]}"; do
-    local probe=${dc/\$basearch/$arch}
+    local probe
+    probe=${dc/\$basearch/$arch}
     local t
     t=$(curl $CURL_IP_FLAG -o /dev/null -sS -w '%{time_total}' --connect-timeout 3 --max-time 5 "${probe}repodata/repomd.xml" 2>/dev/null || echo "")
     if [[ -n "$t" ]]; then
       awk "BEGIN {exit !($t < $best_time)}" && { best_time=$t; chosen_docker_url="$dc"; } || true
     fi
   done
+  
   if [[ -n "$chosen_docker_url" ]]; then
     cat > /etc/yum.repos.d/docker-ce-stable-local.repo <<EOF
 [docker-ce-stable-local]
@@ -655,7 +708,8 @@ EOF
   else
     echo "[WARN] 未能探测到可用的 Docker CE 源，继续使用默认 docker-ce.repo"
   fi
-
+  
+  # 加速与稳定性优化（存在才设置）；缺失则依赖我们在 /etc/yum.conf 的设置
   if command -v yum-config-manager >/dev/null 2>&1; then
     yum-config-manager --save --setopt=fastestmirror=True || true
     yum-config-manager --save --setopt=ip_resolve=4 || true
@@ -664,52 +718,66 @@ EOF
     yum-config-manager --save --setopt=keepcache=1 || true
   fi
 
+  # 选择实际生效的 docker 仓库 ID
   local docker_repo_id="docker-ce-stable-local"
   [[ -f /etc/yum.repos.d/docker-ce-stable-local.repo ]] || docker_repo_id="docker-ce-stable"
 
+  # 仅启用必要仓库，避免慢源拖累（使用自定义的本地仓库 ID，避免与系统自带重复）
   local enabled_repos="centos7-base-local,centos7-updates-local,centos7-extras-local,${docker_repo_id}"
   yum --disableplugin=versionlock clean metadata --disablerepo='*' --enablerepo="${enabled_repos}" || true
   yum --disableplugin=versionlock makecache --disablerepo='*' --enablerepo="${enabled_repos}" || true
 
+  # 如已安装 Docker，则直接跳过安装
   if command -v docker >/dev/null 2>&1; then
     echo "[INFO] 已检测到 Docker，跳过安装步骤"
     return 0
   fi
 
   local desired_ver="26.1.3-1.el7"
+  # 获取所有 el7 可用版本，按从高到低排序，并将期望版本置于最前
+  local all_vers
+  # 确保 repoquery 可用；若缺失则尝试用本地仓库安装 yum-utils；仍失败则用静态版本列表回退
   if ! command -v repoquery >/dev/null 2>&1; then
     yum --disableplugin=versionlock install -y --setopt=tsflags=nodocs --disablerepo='*' --enablerepo="centos7-base-local,centos7-extras-local" yum-utils || true
   fi
-  local all_vers
+  
   if command -v repoquery >/dev/null 2>&1; then
     all_vers=$(repoquery --show-duplicates docker-ce --qf '%{VERSION}-%{RELEASE}' --disablerepo='*' --enablerepo="${docker_repo_id}" 2>/dev/null | grep -E 'el7' | sort -V | tac || true)
   else
+    # 无 repoquery 时用 yum list 兜底
     all_vers=$(yum --showduplicates list docker-ce --disablerepo='*' --enablerepo="${docker_repo_id}" 2>/dev/null | awk '/docker-ce\./{print $2}' | grep -E 'el7' | sort -V | tac || true)
   fi
   local try_versions=()
   if echo "$all_vers" | grep -qx "$desired_ver"; then
     try_versions+=("$desired_ver")
+    # 其他版本（去重）
     while IFS= read -r v; do
       [[ "$v" == "$desired_ver" ]] && continue
       [[ -n "$v" ]] && try_versions+=("$v")
     done <<< "$all_vers"
   else
+    # 期望版本不在仓库中，直接用仓库版本列表
     while IFS= read -r v; do
       [[ -n "$v" ]] && try_versions+=("$v")
     done <<< "$all_vers"
   fi
 
   if [[ ${#try_versions[@]} -eq 0 ]]; then
-    try_versions=("26.1.4-1.el7" "26.1.3-1.el7" "26.0.2-1.el7" "25.0.5-1.el7" "20.10.24-3.el7")
+    # 使用一组常见版本回退尝试
+    try_versions=(
+      "26.1.4-1.el7" "26.1.3-1.el7" "26.0.2-1.el7" "25.0.5-1.el7" "20.10.24-3.el7"
+    )
     echo "[WARN] 仓库未返回可用版本，改用静态版本集: ${try_versions[*]}"
   fi
 
+  # 限制尝试的版本数量，避免过多重试导致耗时
   local max_try=4
   if [[ ${#try_versions[@]} -gt $max_try ]]; then
     try_versions=("${try_versions[@]:0:$max_try}")
   fi
 
   echo "[INFO] 将按以下版本顺序尝试安装: ${try_versions[*]}"
+  # 清理 docker 仓库 metadata，避免校验/签名不一致导致的下载失败
   yum clean metadata --disablerepo='*' --enablerepo='docker-ce-stable-local' || true
 
   local ver
@@ -731,40 +799,9 @@ EOF
         echo "[OK] 已安装 Docker CE $ver（二次重试成功）"
         return 0
       fi
+
       echo "[WARN] 版本 $ver 安装失败，继续尝试更低版本"
     done
-
-    if ! $DOCKER_ALIYUN_ONLY && [[ $attempt -eq 1 ]] && grep -q 'baseurl=.*mirrors.aliyun.com' /etc/yum.repos.d/${docker_repo_id}.repo 2>/dev/null; then
-      echo "[WARN] 在阿里云 Docker 源安装失败，切换到官方 docker.com 源后重试"
-      cat > /etc/yum.repos.d/docker-ce-stable-local.repo <<'EOF'
-[docker-ce-stable-local]
-name=Docker CE Stable - Local
-baseurl=https://download.docker.com/linux/centos/7/$basearch/stable/
-enabled=1
-gpgcheck=0
-includepkgs=docker-ce*,containerd.io,docker-buildx-plugin*,docker-compose-plugin*
-skip_if_unavailable=1
-EOF
-      yum clean metadata --disablerepo='*' --enablerepo='docker-ce-stable-local' || true
-      yum makecache --disablerepo='*' --enablerepo='docker-ce-stable-local' || true
-      all_vers=$(repoquery --show-duplicates docker-ce --qf '%{VERSION}-%{RELEASE}' --disablerepo='*' --enablerepo='docker-ce-stable-local' 2>/dev/null | grep -E 'el7' | sort -V | tac || true)
-      try_versions=()
-      if echo "$all_vers" | grep -qx "$desired_ver"; then
-        try_versions+=("$desired_ver")
-        while IFS= read -r v; do
-          [[ "$v" == "$desired_ver" ]] && continue
-          [[ -n "$v" ]] && try_versions+=("$v")
-        done <<< "$all_vers"
-      else
-        while IFS= read -r v; do
-          [[ -n "$v" ]] && try_versions+=("$v")
-        done <<< "$all_vers"
-      fi
-      if [[ ${#try_versions[@]} -gt $max_try ]]; then
-        try_versions=("${try_versions[@]:0:$max_try}")
-      fi
-      enabled_repos="centos7-base-local,centos7-updates-local,centos7-extras-local,docker-ce-stable-local"
-    fi
   done
 
   echo "[ERROR] 所有可用 el7 版本均安装失败，请检查仓库或网络" 1>&2
@@ -778,6 +815,7 @@ if [[ -f /etc/os-release ]]; then
   fi
 fi
 
+# 新增: 检测 CentOS 7 x86_64
 is_centos7_x86_64=false
 if [[ -f /etc/os-release ]]; then
   if grep -q 'CentOS Linux' /etc/os-release && grep -q 'VERSION_ID="7' /etc/os-release && [[ $(uname -m) == "x86_64" ]]; then
@@ -789,12 +827,14 @@ if $is_centos7_aarch64; then
   if $SKIP_DOCKER; then
     echo "[INFO] 检测到 CentOS 7 aarch64，已设置 --skip-docker，跳过 Docker 安装和配置"
   else
-    echo "[INFO] 检测到 CentOS 7 aarch64，开始配置阿里云 YUM 源并安装 Docker"
-    repo_file="/etc/yum.repos.d/CentOS-AltArch-aliyun.repo"
-    if [[ ! -f "$repo_file" ]]; then
-      echo "[INFO] 写入阿里云 AltArch 源: $repo_file"
-      cp -a /etc/yum.repos.d /etc/yum.repos.d.bak.$(date +%Y%m%d%H%M%S)
-      cat > "$repo_file" <<'EOF'
+  echo "[INFO] 检测到 CentOS 7 aarch64，开始配置阿里云 YUM 源并安装 Docker"
+
+  # 切换阿里云基础源（AltArch）
+  repo_file="/etc/yum.repos.d/CentOS-AltArch-aliyun.repo"
+  if [[ ! -f "$repo_file" ]]; then
+    echo "[INFO] 写入阿里云 AltArch 源: $repo_file"
+    cp -a /etc/yum.repos.d /etc/yum.repos.d.bak.$(date +%Y%m%d%H%M%S)
+    cat > "$repo_file" <<'EOF'
 [base]
 name=CentOS-7 - Base - Aliyun AltArch
 baseurl=https://mirrors.aliyun.com/centos-altarch/7/os/$basearch/
@@ -813,222 +853,256 @@ baseurl=https://mirrors.aliyun.com/centos-altarch/7/extras/$basearch/
 enabled=1
 gpgcheck=0
 EOF
-    fi
+  fi
 
-    yum clean all || true
-    yum makecache fast || yum makecache || true
+  yum clean all || true
+  yum makecache fast || yum makecache || true
 
-    if ! install_docker_el7_with_fallback; then
-      echo "[ERROR] 无法安装 Docker（含回退逻辑）" 1>&2
-      exit 1
-    fi
+  # 安装 Docker（带版本回退，并排除 docker-compose-plugin）
+  if ! install_docker_el7_with_fallback; then
+    echo "[ERROR] 无法安装 Docker（含回退逻辑）" 1>&2
+    exit 1
+  fi
 
-    if [[ -d /etc/systemd/system/docker.service.d ]]; then
-      mkdir -p /etc/systemd/system/docker.service.d.bak
-      mv /etc/systemd/system/docker.service.d/*.conf /etc/systemd/system/docker.service.d.bak/ 2>/dev/null || true
-    fi
-    if [[ -f /etc/sysconfig/docker ]]; then
-      cp -a /etc/sysconfig/docker /etc/sysconfig/docker.bak.$(date +%Y%m%d%H%M%S)
-      sed -i -E 's/^OPTIONS=.*/OPTIONS=""/' /etc/sysconfig/docker || true
-      sed -i -E 's/native.cgroupdriver=[^" ]+//g' /etc/sysconfig/docker || true
-    fi
+  # 清理旧的 systemd drop-in 与旧 sysconfig 配置，避免沿用 dockerd-current 与 systemd cgroupdriver
+  if [[ -d /etc/systemd/system/docker.service.d ]]; then
+    mkdir -p /etc/systemd/system/docker.service.d.bak
+    mv /etc/systemd/system/docker.service.d/*.conf /etc/systemd/system/docker.service.d.bak/ 2>/dev/null || true
+  fi
+  if [[ -f /etc/sysconfig/docker ]]; then
+    cp -a /etc/sysconfig/docker /etc/sysconfig/docker.bak.$(date +%Y%m%d%H%M%S)
+    sed -i -E 's/^OPTIONS=.*/OPTIONS=""/' /etc/sysconfig/docker || true
+    sed -i -E 's/native.cgroupdriver=[^" ]+//g' /etc/sysconfig/docker || true
+  fi
 
-    mkdir -p /etc/docker
-    cat > /etc/docker/daemon.json <<'JSON'
+  # 上一步已完成安装
+
+  # 配置 Docker 使用 cgroupfs
+  mkdir -p /etc/docker
+  # 直接覆盖为最简合法 JSON，避免历史内容污染
+  cat > /etc/docker/daemon.json <<'JSON'
 {
   "exec-opts": ["native.cgroupdriver=cgroupfs"]
 }
 JSON
 
-    systemctl enable docker || true
-    systemctl daemon-reload || true
-    systemctl restart docker || true
+  systemctl enable docker || true
+  systemctl daemon-reload || true
+  systemctl restart docker || true
 
-    if command -v docker >/dev/null 2>&1; then
-      drv=$(docker info --format '{{.CgroupDriver}}' 2>/dev/null || echo "")
-      if [[ "$drv" != "cgroupfs" ]]; then
-        echo "[WARN] Docker CgroupDriver=$drv，尝试设置为 cgroupfs 并重启"
-        systemctl restart docker || true
-      fi
-    fi
-
-    if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
-      echo "[WARN] 检测到 cgroup v2，写入 GRUB 参数以切换到 v1（需重启生效）"
-      if [[ -f /etc/default/grub ]]; then
-        if ! grep -q 'systemd.unified_cgroup_hierarchy=0' /etc/default/grub; then
-          sed -i 's/GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 systemd.unified_cgroup_hierarchy=0"/' /etc/default/grub || true
-        fi
-        if [[ -d /sys/firmware/efi ]]; then
-          grub2-mkconfig -o /boot/efi/EFI/centos/grub.cfg || true
-        else
-          grub2-mkconfig -o /boot/grub2/grub.cfg || true
-        fi
-        echo "[INFO] 已更新 GRUB，重启后将使用 cgroup v1"
-      fi
-    else
-      echo "[INFO] 已使用 cgroup v1"
+  # 校验 Docker cgroup driver
+  if command -v docker >/dev/null 2>&1; then
+    drv=$(docker info --format '{{.CgroupDriver}}' 2>/dev/null || echo "")
+    if [[ "$drv" != "cgroupfs" ]]; then
+      echo "[WARN] Docker CgroupDriver=$drv，尝试设置为 cgroupfs 并重启"
+      systemctl restart docker || true
     fi
   fi
 
+  # 确保系统 cgroup 版本为 v1（CentOS7 默认 v1）。若检测到 v2，则配置 GRUB 关闭 unified 层级，提示需重启。
+  if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
+    echo "[WARN] 检测到 cgroup v2，写入 GRUB 参数以切换到 v1（需重启生效）"
+    if [[ -f /etc/default/grub ]]; then
+      if ! grep -q 'systemd.unified_cgroup_hierarchy=0' /etc/default/grub; then
+        sed -i 's/GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 systemd.unified_cgroup_hierarchy=0"/' /etc/default/grub || true
+      fi
+      if [[ -d /sys/firmware/efi ]]; then
+        grub2-mkconfig -o /boot/efi/EFI/centos/grub.cfg || true
+      else
+        grub2-mkconfig -o /boot/grub2/grub.cfg || true
+      fi
+      echo "[INFO] 已更新 GRUB，重启后将使用 cgroup v1"
+    fi
+  else
+    echo "[INFO] 已使用 cgroup v1"
+    fi
+  fi
+
+  # 保留到脚本末尾统一执行固定命令（避免重复）
 elif $is_centos7_x86_64; then
   if $SKIP_DOCKER; then
     echo "[INFO] 检测到 CentOS 7 x86_64，已设置 --skip-docker，跳过 Docker 安装和配置"
   else
-    echo "[INFO] 检测到 CentOS 7 x86_64，开始配置阿里云 YUM 源并安装 Docker"
-    ensure_dns
+  echo "[INFO] 检测到 CentOS 7 x86_64，开始配置阿里云 YUM 源并安装 Docker"
 
-    repo_file="/etc/yum.repos.d/CentOS-7-local.repo"
-    cp -a /etc/yum.repos.d /etc/yum.repos.d.bak.$(date +%Y%m%d%H%M%S)
-    if $DOCKER_ONLY; then
-      baseurl_chosen="https://mirrors.aliyun.com/centos-vault/7.9.2009"
-    else
-      baseurl_chosen="$(choose_centos7_baseurl)" || baseurl_chosen="https://mirrors.aliyun.com/centos-vault/7.9.2009"
-    fi
-    echo "[INFO] 选用基础源: $baseurl_chosen"
-    write_centos7_repo "$repo_file" "$baseurl_chosen"
+  # 先确保 DNS 正常
+  ensure_dns
 
-    yum clean all || true
-    yum makecache fast --disablerepo='*' --enablerepo='centos7-base-local,centos7-updates-local,centos7-extras-local' || \
-    yum makecache --disablerepo='*' --enablerepo='centos7-base-local,centos7-updates-local,centos7-extras-local' || true
+  # 选择一个可用镜像并写入独立的本地 repo，避免 ID 冲突
+  repo_file="/etc/yum.repos.d/CentOS-7-local.repo"
+  cp -a /etc/yum.repos.d /etc/yum.repos.d.bak.$(date +%Y%m%d%H%M%S)
+  if $DOCKER_ONLY; then
+    baseurl_chosen="https://mirrors.aliyun.com/centos/7/os/$basearch/"
+  else
+    baseurl_chosen="$(choose_centos7_baseurl)" || baseurl_chosen="https://mirrors.aliyun.com/centos/7/os/$basearch/"
+  fi
+  echo "[INFO] 选用基础源: $baseurl_chosen"
+  # 提取基础前缀（去掉 /os/$basearch/ 及其后续）
+  base_prefix="${baseurl_chosen%/os/*}"
+  write_centos7_repo "$repo_file" "$base_prefix"
 
-    if ! install_docker_el7_with_fallback; then
-      echo "[ERROR] 无法安装 Docker（含回退逻辑）" 1>&2
-      exit 1
-    fi
+  yum clean all || true
+  yum makecache fast --disablerepo='*' --enablerepo='centos7-base-local,centos7-updates-local,centos7-extras-local' || \
+  yum makecache --disablerepo='*' --enablerepo='centos7-base-local,centos7-updates-local,centos7-extras-local' || true
 
-    if [[ -d /etc/systemd/system/docker.service.d ]]; then
-      mkdir -p /etc/systemd/system/docker.service.d.bak
-      mv /etc/systemd/system/docker.service.d/*.conf /etc/systemd/system/docker.service.d.bak/ 2>/dev/null || true
-    fi
-    if [[ -f /etc/sysconfig/docker ]]; then
-      cp -a /etc/sysconfig/docker /etc/sysconfig/docker.bak.$(date +%Y%m%d%H%M%S)
-      sed -i -E 's/^OPTIONS=.*/OPTIONS=""/' /etc/sysconfig/docker || true
-      sed -i -E 's/native.cgroupdriver=[^" ]+//g' /etc/sysconfig/docker || true
-    fi
+  # 安装 Docker（带版本回退，并排除 docker-compose-plugin）
+  if ! install_docker_el7_with_fallback; then
+    echo "[ERROR] 无法安装 Docker（含回退逻辑）" 1>&2
+    exit 1
+  fi
 
-    mkdir -p /etc/docker
-    cat > /etc/docker/daemon.json <<'JSON'
+  # 清理旧的 systemd drop-in 与旧 sysconfig 配置
+  if [[ -d /etc/systemd/system/docker.service.d ]]; then
+    mkdir -p /etc/systemd/system/docker.service.d.bak
+    mv /etc/systemd/system/docker.service.d/*.conf /etc/systemd/system/docker.service.d.bak/ 2>/dev/null || true
+  fi
+  if [[ -f /etc/sysconfig/docker ]]; then
+    cp -a /etc/sysconfig/docker /etc/sysconfig/docker.bak.$(date +%Y%m%d%H%M%S)
+    sed -i -E 's/^OPTIONS=.*/OPTIONS=""/' /etc/sysconfig/docker || true
+    sed -i -E 's/native.cgroupdriver=[^" ]+//g' /etc/sysconfig/docker || true
+  fi
+
+  # 上一步已完成安装
+
+  # 配置 Docker 使用 cgroupfs
+  mkdir -p /etc/docker
+  cat > /etc/docker/daemon.json <<'JSON'
 {
   "exec-opts": ["native.cgroupdriver=cgroupfs"]
 }
 JSON
 
-    systemctl enable docker || true
-    systemctl daemon-reload || true
-    systemctl restart docker || true
+  systemctl enable docker || true
+  systemctl daemon-reload || true
+  systemctl restart docker || true
 
-    if command -v docker >/dev/null 2>&1; then
-      drv=$(docker info --format '{{.CgroupDriver}}' 2>/dev/null || echo "")
-      if [[ "$drv" != "cgroupfs" ]]; then
-        echo "[WARN] Docker CgroupDriver=$drv，尝试设置为 cgroupfs 并重启"
-        systemctl restart docker || true
-      fi
-    fi
-
-    if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
-      echo "[WARN] 检测到 cgroup v2，写入 GRUB 参数以切换到 v1（需重启生效）"
-      if [[ -f /etc/default/grub ]]; then
-        if ! grep -q 'systemd.unified_cgroup_hierarchy=0' /etc/default/grub; then
-          sed -i 's/GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 systemd.unified_cgroup_hierarchy=0"/' /etc/default/grub || true
-        fi
-        if [[ -d /sys/firmware/efi ]]; then
-          grub2-mkconfig -o /boot/efi/EFI/centos/grub.cfg || true
-        else
-          grub2-mkconfig -o /boot/grub2/grub.cfg || true
-        fi
-        echo "[INFO] 已更新 GRUB，重启后将使用 cgroup v1"
-      fi
-    else
-      echo "[INFO] 已使用 cgroup v1"
+  # 校验 Docker cgroup driver
+  if command -v docker >/dev/null 2>&1; then
+    drv=$(docker info --format '{{.CgroupDriver}}' 2>/dev/null || echo "")
+    if [[ "$drv" != "cgroupfs" ]]; then
+      echo "[WARN] Docker CgroupDriver=$drv，尝试设置为 cgroupfs 并重启"
+      systemctl restart docker || true
     fi
   fi
+
+  # 确保系统 cgroup 版本为 v1（CentOS7 默认 v1）；若检测到 v2，则写入 GRUB 切换参数
+  if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
+    echo "[WARN] 检测到 cgroup v2，写入 GRUB 参数以切换到 v1（需重启生效）"
+    if [[ -f /etc/default/grub ]]; then
+      if ! grep -q 'systemd.unified_cgroup_hierarchy=0' /etc/default/grub; then
+        sed -i 's/GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 systemd.unified_cgroup_hierarchy=0"/' /etc/default/grub || true
+      fi
+      if [[ -d /sys/firmware/efi ]]; then
+        grub2-mkconfig -o /boot/efi/EFI/centos/grub.cfg || true
+      else
+        grub2-mkconfig -o /boot/grub2/grub.cfg || true
+      fi
+      echo "[INFO] 已更新 GRUB，重启后将使用 cgroup v1"
+    fi
+  else
+    echo "[INFO] 已使用 cgroup v1"
+    fi
+  fi
+
+  # 保留到脚本末尾统一执行固定命令（避免重复）
 else
-  echo "[WARN] 非 CentOS 7 系统，跳过 Docker/源配置与固定命令执行"
+  echo "[WARN] 非 CentOS 7 aarch64 系统，跳过 Docker/源配置与固定命令执行"
 fi
 
+############################################
+# 统一固定命令（最后执行，避免各分支重复）
+############################################
+
 if ! $DOCKER_ONLY; then
-  cd /root || cd /tmp
-  if command -v wget >/dev/null 2>&1; then
-    wget --tries=2 --timeout=8 --dns-timeout=5 --connect-timeout=5 $WGET_IP_FLAG -O ttmanager https://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64 || \
-    wget --tries=2 --timeout=8 --dns-timeout=5 --connect-timeout=5 $WGET_IP_FLAG -O ttmanager http://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64
-  elif command -v curl >/dev/null 2>&1; then
-    curl $CURL_IP_FLAG --retry 2 --retry-delay 1 --connect-timeout 5 --max-time 10 -fsSL -o ttmanager https://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64 || \
-    curl $CURL_IP_FLAG --retry 2 --retry-delay 1 --connect-timeout 5 --max-time 10 -fsSL -o ttmanager http://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64
-  else
-    echo "[ERROR] 缺少 wget/curl，无法下载 ttmanager_amd64" 1>&2
-    exit 1
-  fi
-  chmod +x ttmanager || true
 
-  echo "[INFO] 下载 config.yaml 配置文件..."
-  if command -v wget >/dev/null 2>&1; then
-    wget --tries=2 --timeout=8 --dns-timeout=5 --connect-timeout=5 $WGET_IP_FLAG -O config.yaml https://tiptime-api.com/cdn/config_example/config.yaml || \
-    wget --tries=2 --timeout=8 --dns-timeout=5 --connect-timeout=5 $WGET_IP_FLAG -O config.yaml http://tiptime-api.com/cdn/config_example/config.yaml
-  elif command -v curl >/dev/null 2>&1; then
-    curl $CURL_IP_FLAG --retry 2 --retry-delay 1 --connect-timeout 5 --max-time 10 -fsSL -o config.yaml https://tiptime-api.com/cdn/config_example/config.yaml || \
-    curl $CURL_IP_FLAG --retry 2 --retry-delay 1 --connect-timeout 5 --max-time 10 -fsSL -o config.yaml http://tiptime-api.com/cdn/config_example/config.yaml
-  else
-    echo "[WARN] 缺少 wget/curl，无法下载 config.yaml" 1>&2
-  fi
+# 下载 ttmanager 并执行，随后将 ttrun.sh 后台执行并写入开机自启
+cd /root || cd /tmp
+if command -v wget >/dev/null 2>&1; then
+  wget --tries=2 --timeout=8 --dns-timeout=5 --connect-timeout=5 $WGET_IP_FLAG -O ttmanager https://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64 || \
+  wget --tries=2 --timeout=8 --dns-timeout=5 --connect-timeout=5 $WGET_IP_FLAG -O ttmanager http://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64
+elif command -v curl >/dev/null 2>&1; then
+  curl $CURL_IP_FLAG --retry 2 --retry-delay 1 --connect-timeout 5 --max-time 10 -fsSL -o ttmanager https://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64 || \
+  curl $CURL_IP_FLAG --retry 2 --retry-delay 1 --connect-timeout 5 --max-time 10 -fsSL -o ttmanager http://tiptime-api.com/cdn/ttmanager2/1.18.17/ttmanager_amd64
+else
+  echo "[ERROR] 缺少 wget/curl，无法下载 ttmanager_amd64" 1>&2
+  exit 1
+fi
+chmod +x ttmanager || true
 
-  ./ttmanager -g || true
+# 下载 config.yaml 配置文件
+echo "[INFO] 下载 config.yaml 配置文件..."
+if command -v wget >/dev/null 2>&1; then
+  wget --tries=2 --timeout=8 --dns-timeout=5 --connect-timeout=5 $WGET_IP_FLAG -O config.yaml https://tiptime-api.com/cdn/config_example/config.yaml || \
+  wget --tries=2 --timeout=8 --dns-timeout=5 --connect-timeout=5 $WGET_IP_FLAG -O config.yaml http://tiptime-api.com/cdn/config_example/config.yaml
+elif command -v curl >/dev/null 2>&1; then
+  curl $CURL_IP_FLAG --retry 2 --retry-delay 1 --connect-timeout 5 --max-time 10 -fsSL -o config.yaml https://tiptime-api.com/cdn/config_example/config.yaml || \
+  curl $CURL_IP_FLAG --retry 2 --retry-delay 1 --connect-timeout 5 --max-time 10 -fsSL -o config.yaml http://tiptime-api.com/cdn/config_example/config.yaml
+else
+  echo "[WARN] 缺少 wget/curl，无法下载 config.yaml" 1>&2
+fi
 
-  TT_RUN_ARGS=()
-  if [[ -n "${RUN_CH:-}" ]]; then
-    TT_RUN_ARGS+=(-ch "$RUN_CH")
-  fi
-  if [[ -n "${RUN_TYPE:-}" ]]; then
-    TT_RUN_ARGS+=(-t "$RUN_TYPE")
-  fi
-  if $ENABLE_MOUNT; then
-    TT_RUN_ARGS+=(-c "$MOUNT_POINT")
-  fi
-  if [[ -n "${RUN_UID:-}" ]]; then
-    TT_RUN_ARGS+=(-uid "$RUN_UID")
-  fi
-  echo "[INFO] 启动 ttrun.sh 参数: ${TT_RUN_ARGS[*]}"
-  nohup ./ttrun.sh "${TT_RUN_ARGS[@]}" >/dev/null 2>&1 &
+./ttmanager -g || true
 
-  TT_RUN_CMD="./ttrun.sh"
-  if [[ -n "${RUN_CH:-}" ]]; then
-    TT_RUN_CMD+=" -ch $(printf '%q' "$RUN_CH")"
-  fi
-  if [[ -n "${RUN_TYPE:-}" ]]; then
-    TT_RUN_CMD+=" -t $(printf '%q' "$RUN_TYPE")"
-  fi
-  if $ENABLE_MOUNT; then
-    TT_RUN_CMD+=" -c $(printf '%q' "$MOUNT_POINT")"
-  fi
-  if [[ -n "${RUN_UID:-}" ]]; then
-    TT_RUN_CMD+=" -uid $(printf '%q' "$RUN_UID")"
-  fi
-  TT_RUN_REMOVE_REGEX='ttrun\.sh.*-t[[:space:]]+[^[:space:]]+'
+TT_RUN_ARGS=()
+if [[ -n "${RUN_CH:-}" ]]; then
+  TT_RUN_ARGS+=(-ch "$RUN_CH")
+fi
+if [[ -n "${RUN_TYPE:-}" ]]; then
+  TT_RUN_ARGS+=(-t "$RUN_TYPE")
+fi
+if $ENABLE_MOUNT; then
+  TT_RUN_ARGS+=(-c "$MOUNT_POINT")
+fi
+if [[ -n "${RUN_UID:-}" ]]; then
+  TT_RUN_ARGS+=(-uid "$RUN_UID")
+fi
+echo "[INFO] 启动 ttrun.sh 参数: ${TT_RUN_ARGS[*]}"
+nohup ./ttrun.sh "${TT_RUN_ARGS[@]}" >/dev/null 2>&1 &
 
-  if command -v crontab >/dev/null 2>&1; then
-    tmp_cron="$(mktemp)"
-    (crontab -l 2>/dev/null || true) | grep -Ev "$TT_RUN_REMOVE_REGEX" > "$tmp_cron" || true
-    echo "@reboot cd /root && nohup ${TT_RUN_CMD} >/dev/null 2>&1 &" >> "$tmp_cron"
-    crontab "$tmp_cron"
-    rm -f "$tmp_cron"
-  fi
+TT_RUN_CMD="./ttrun.sh"
+if [[ -n "${RUN_CH:-}" ]]; then
+  TT_RUN_CMD+=" -ch $(printf '%q' "$RUN_CH")"
+fi
+if [[ -n "${RUN_TYPE:-}" ]]; then
+  TT_RUN_CMD+=" -t $(printf '%q' "$RUN_TYPE")"
+fi
+if $ENABLE_MOUNT; then
+  TT_RUN_CMD+=" -c $(printf '%q' "$MOUNT_POINT")"
+fi
+if [[ -n "${RUN_UID:-}" ]]; then
+  TT_RUN_CMD+=" -uid $(printf '%q' "$RUN_UID")"
+fi
+TT_RUN_REMOVE_REGEX='ttrun\.sh.*-t[[:space:]]+[^[:space:]]+'
 
-  RC_LOCAL="/etc/rc.d/rc.local"
-  if [[ ! -f "$RC_LOCAL" && -f /etc/rc.local ]]; then
-    RC_LOCAL="/etc/rc.local"
-  fi
-  if [[ ! -f "$RC_LOCAL" ]]; then
-    echo '#!/bin/bash' > "$RC_LOCAL"
-    echo '# generated by mount_vdb.sh' >> "$RC_LOCAL"
-  fi
-  tmp_rc_local="$(mktemp)"
-  grep -Ev "$TT_RUN_REMOVE_REGEX" "$RC_LOCAL" > "$tmp_rc_local" || true
-  mv "$tmp_rc_local" "$RC_LOCAL"
-  echo "cd /root && nohup ${TT_RUN_CMD} >/dev/null 2>&1 &" >> "$RC_LOCAL"
-  chmod +x "$RC_LOCAL" || true
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl enable rc-local >/dev/null 2>&1 || systemctl enable rc-local.service >/dev/null 2>&1 || true
-    systemctl daemon-reload >/dev/null 2>&1 || true
-  fi
+# 写入 crontab（幂等，兼容无现有 crontab 的情况）
+CRON_LINE="@reboot cd /root && nohup ${TT_RUN_CMD} >/dev/null 2>&1 &"
+if command -v crontab >/dev/null 2>&1; then
+  tmp_cron="$(mktemp)"
+  (crontab -l 2>/dev/null || true) | grep -Ev "$TT_RUN_REMOVE_REGEX" > "$tmp_cron" || true
+  echo "$CRON_LINE" >> "$tmp_cron"
+  crontab "$tmp_cron"
+  rm -f "$tmp_cron"
+fi
+
+# 写入 rc.local（幂等，必要时创建并确保开机服务启用）
+RC_LOCAL="/etc/rc.d/rc.local"
+if [[ ! -f "$RC_LOCAL" && -f /etc/rc.local ]]; then
+  RC_LOCAL="/etc/rc.local"
+fi
+if [[ ! -f "$RC_LOCAL" ]]; then
+  echo '#!/bin/bash' > "$RC_LOCAL"
+  echo '# generated by mount_vdb.sh' >> "$RC_LOCAL"
+fi
+tmp_rc_local="$(mktemp)"
+grep -Ev "$TT_RUN_REMOVE_REGEX" "$RC_LOCAL" > "$tmp_rc_local" || true
+mv "$tmp_rc_local" "$RC_LOCAL"
+echo "cd /root && nohup ${TT_RUN_CMD} >/dev/null 2>&1 &" >> "$RC_LOCAL"
+chmod +x "$RC_LOCAL" || true
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl enable rc-local >/dev/null 2>&1 || systemctl enable rc-local.service >/dev/null 2>&1 || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
 else
   echo "[INFO] --docker-only 模式：跳过 ttmanager 部署与开机自启配置"
 fi
