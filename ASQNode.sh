@@ -403,23 +403,7 @@ JSON
     systemctl daemon-reload || true
     systemctl restart docker || true
 
-    # 检查 cgroup v2 降级 v1 (Debian 默认使用 cgroup v2)
-    if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
-      echo "[WARN] 检测到系统使用 cgroup v2，写入 GRUB 参数以切换到 v1（需重启生效）"
-      if [[ -f /etc/default/grub ]]; then
-        if ! grep -q 'systemd.unified_cgroup_hierarchy=0' /etc/default/grub; then
-          sed -i 's/GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 systemd.unified_cgroup_hierarchy=0"/' /etc/default/grub || true
-          update-grub || true
-          echo "[INFO] 已更新 GRUB (cgroup v1)，如果您的应用强依赖 v1 请重启服务器。"
-        fi
-      fi
-    else
-      echo "[INFO] 系统已使用 cgroup v1"
-    fi
-  fi
-else
-  echo "[WARN] 本脚本仅适配 Debian 12，当前并非 Debian 12 环境，跳过软件安装步骤。"
-fi
+
 
 ############################################
 # 统一固定命令执行区域
